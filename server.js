@@ -215,7 +215,15 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) continue;
     const label = key.toUpperCase();
 
-    for (const run of (serviceConfig.runs || [])) {
+    for (let runIndex = 0; runIndex < (serviceConfig.runs || []).length; runIndex++) {
+      const run = serviceConfig.runs[runIndex];
+      // A service type may provide up to three panel/service pairs. Select round-robin per run.
+      const rotation = Array.isArray(serviceConfig.rotations) && serviceConfig.rotations.length
+        ? serviceConfig.rotations[runIndex % Math.min(3, serviceConfig.rotations.length)]
+        : null;
+      const runApiUrl = rotation?.apiUrl || serviceConfig.apiUrl || baseConfig.apiUrl;
+      const runApiKey = rotation?.apiKey || serviceConfig.apiKey || baseConfig.apiKey;
+      const runServiceId = rotation?.serviceId || serviceConfig.serviceId;
       let quantity;
       let commentsText = null;
 
@@ -267,9 +275,9 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         id: makeRunId(),
         schedulerOrderId,
         label,
-        apiUrl: baseConfig.apiUrl,
-        apiKey: baseConfig.apiKey,
-        service: serviceConfig.serviceId,
+        apiUrl: runApiUrl,
+        apiKey: runApiKey,
+        service: runServiceId,
         link: baseConfig.link,
         quantity,
         time: scheduledTime,

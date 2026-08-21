@@ -799,8 +799,8 @@ app.get('/api/settings/min-views', (_req, res) => {
 
 app.post('/api/settings/min-views', async (req, res) => {
   const { minViewsPerRun } = req.body || {};
-  if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
-    return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
+  if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 100) {
+    return res.status(400).json({ error: 'Minimum views per run cannot be below 100' });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
   await saveMinViewsSetting(MIN_VIEWS_PER_RUN);

@@ -14,12 +14,39 @@ const express  = require('express');
 const cors     = require('cors');
 const axios    = require('axios');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
+
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SESSION_COOKIE = 'truesmm_session';
+const SESSION_MAX_AGE = 10 * 365 * 24 * 60 * 60 * 1000;
+
+function hashToken(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+function parseCookies(req) {
+  return Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(part => {
+    const i = part.indexOf('=');
+    return [part.slice(0, i).trim(), decodeURIComponent(part.slice(i + 1).trim())];
+  }));
+}
+async function supabaseRequest(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error('Supabase server credentials are not configured');
+  const response = await fetch(`${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/${path}`, {
+    ...options,
+    headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', ...(options.headers || {}) },
+  });
+  const text = await response.text();
+  let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) throw new Error(typeof data === 'object' ? (data?.message || data?.error || `Supabase HTTP ${response.status}`) : `Supabase HTTP ${response.status}`);
+  return data;
+}
 
 /* ============================================================
    CONFIG
@@ -114,9 +141,18 @@ const SettingsSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+const SessionSchema = new mongoose.Schema({
+  tokenHash: { type: String, required: true, unique: true, index: true },
+  accessKeyId: { type: String, required: true, index: true },
+  expiresAt: { type: Date, default: null },
+  createdAt: { type: Date, default: Date.now },
+});
+SessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, partialFilterExpression: { expiresAt: { $type: 'date' } } });
+
 const Run      = mongoose.model('Run', RunSchema);
 const Order    = mongoose.model('Order', OrderSchema);
 const Settings = mongoose.model('Settings', SettingsSchema);
+const Session  = mongoose.model('Session', SessionSchema);
 
 /* ============================================================
    SETTINGS (loaded from DB at boot)
@@ -607,8 +643,55 @@ process.on('SIGTERM', async () => {
 });
 
 /* ============================================================
+   AUTHENTICATION
+   ============================================================ */
+async function findAccessKeyById(id) {
+  const rows = await supabaseRequest(`access_keys?id=eq.${encodeURIComponent(id)}&select=id,key,is_active,expires_at`);
+  return Array.isArray(rows) ? rows[0] : null;
+}
+async function requireAuth(req, res, next) {
+  try {
+    const raw = parseCookies(req)[SESSION_COOKIE];
+    if (!raw) return res.status(401).json({ error: 'Authentication required' });
+    const session = await Session.findOne({ tokenHash: hashToken(raw) }).lean();
+    if (!session || (session.expiresAt && session.expiresAt <= new Date())) return res.status(401).json({ error: 'Session expired' });
+    const accessKey = await findAccessKeyById(session.accessKeyId);
+    if (!accessKey || !accessKey.is_active || (accessKey.expires_at && new Date(accessKey.expires_at) <= new Date())) return res.status(401).json({ error: 'Access key inactive or expired' });
+    req.auth = { accessKeyId: String(accessKey.id) };
+    next();
+  } catch (e) { return res.status(401).json({ error: 'Authentication unavailable' }); }
+}
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const key = String(req.body?.key || '').trim().toUpperCase();
+    if (!key) return res.status(400).json({ error: 'Access key is required' });
+    const rows = await supabaseRequest(`access_keys?key=eq.${encodeURIComponent(key)}&select=id,key,is_active,expires_at`);
+    const accessKey = Array.isArray(rows) ? rows[0] : null;
+    if (!accessKey || !accessKey.is_active) return res.status(401).json({ error: 'Invalid or revoked access key' });
+    if (accessKey.expires_at && new Date(accessKey.expires_at) <= new Date()) return res.status(401).json({ error: 'Access key expired' });
+    // One active device per key: invalidate all previous sessions.
+    await Session.deleteMany({ accessKeyId: String(accessKey.id) });
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = accessKey.expires_at ? new Date(accessKey.expires_at) : null;
+    await Session.create({ tokenHash: hashToken(rawToken), accessKeyId: String(accessKey.id), expiresAt });
+    const maxAge = expiresAt ? Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000)) : Math.floor(SESSION_MAX_AGE / 1000);
+    const cookie = `${SESSION_COOKIE}=${encodeURIComponent(rawToken)}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=None; Secure`;
+    res.setHeader('Set-Cookie', cookie);
+    return res.json({ success: true, lifetime: !expiresAt });
+  } catch (e) { return res.status(500).json({ error: e?.message || 'Login failed' }); }
+});
+app.get('/api/auth/session', requireAuth, (req, res) => res.json({ authenticated: true, accessKeyId: req.auth.accessKeyId }));
+app.post('/api/auth/logout', async (req, res) => {
+  const raw = parseCookies(req)[SESSION_COOKIE];
+  if (raw) await Session.deleteOne({ tokenHash: hashToken(raw) }).catch(() => {});
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=None; Secure`);
+  res.json({ success: true });
+});
+
+/* ============================================================
    ROUTES
    ============================================================ */
+app.use(['/api/order', '/api/orders', '/api/services'], requireAuth);
 
 // ---- Create order ----
 app.post('/api/order', async (req, res) => {
